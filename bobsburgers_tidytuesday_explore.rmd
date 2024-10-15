@@ -1,0 +1,607 @@
+---
+title: "TidyTuesday_BobsBurgers"
+output: html_document
+date: "2024-11-19"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Bobsburgers Tidy Tuesday
+
+```{r libraries}
+library(usethis)
+library(tidytuesdayR)
+library(tidyverse)
+library(gt)
+library(gtsummary)
+library(ggplot2)
+library(janitor)
+library(sf)
+library(BAMMtools)
+library(magick)
+library(camcorder)
+library(bobsburgersR)
+library(tidytext)
+library(datapasta)
+library(gifski)
+
+```
+
+## Load data
+
+```{r weeksdata, echo=FALSE}
+bbdattdyr <- tidytuesdayR::tt_load('2024-11-19') 
+
+bbdat <-bbdattdyr$episode_metrics
+
+
+```
+## Explore the maximum episodes
+```{r explore, echo=FALSE}
+#Average number of episodes, complicated
+bbdat %>% 
+    group_by(season) %>% 
+    mutate(maxep = max(episode)) %>% 
+    filter(episode==maxep) %>% 
+    ungroup() %>% 
+    mutate(avg = mean(maxep))
+
+#average number of episodes, simplified
+bbdat %>% 
+    group_by(season) %>% 
+    summarise(maxep = max(episode)) %>% 
+    summarise(avgep = mean(maxep))
+```
+
+#What is sentiment variance and is it affected by the number of unique words?
+
+```{r sentexp, echo=FALSE}
+ggplot(bbdat, aes(sentiment_variance)) +
+    geom_histogram()
+
+ggplot(bbdat, aes(sentiment_variance, unique_words)) +
+    geom_point()
+
+#There is a huge outlier in season 8 episode 6 of unique words
+ggplot(bbdat, aes(unique_words)) +
+    geom_histogram()
+
+#dialogue density is an odd measure, almost binomial .5 and nearing 1
+#'dialogue density' is defined as the number of non-blank lines in the episode. So if there aren't a lot of pauses or 'looks' I would think it would be close to 1
+
+```
+
+Background on AFINN sentiment analysis: https://review.gale.com/2023/08/22/understanding-recent-enhancements-to-sentiment-analysis-in-gale-digital-scholar-lab/
+
+https://darenr.github.io/afinn/
+
+```{r relationshipsexp, echo=FALSE}
+#There's a visual relationship between dialogue desnity and average length
+ggplot(bbdat, aes(dialogue_density, avg_length)) +
+    geom_point()
+
+#dialogue density goes way down in seasons 13 and 14, this may be impacting the question and exclamation ratios
+bbdat %>% 
+  filter(dialogue_density<0.8)
+
+#I would think there's a linear relationship between unique words and average length. The more characters per line, the more 'chance' of a unique word
+ggplot(bbdat, aes(unique_words, avg_length)) +
+    geom_point()
+
+#Another way to visualize what I saw below. That average length plummets in the later seasons but the number of unique words does not
+ggplot(bbdat, aes(unique_words, avg_length, group=season, color=season)) +
+    geom_point()
+
+```
+#Possible questions are 
+## Do metrics differ across seasons? (different writers?)
+## Do metrics differ across earlier, middle, and later episodes? (interesting to the audience or 'tying up' a seaoson at the end)
+```{r facetexp, echo=FALSE}
+#Avg length of a line by season
+ggplot(bbdat, aes(avg_length)) +
+    geom_histogram() +
+    facet_wrap(~season)
+#make a function for this
+fctsimple <- function(data, var, bywhat) {
+              ggplot(data, aes({{var}})) +
+                    geom_histogram() +
+                    facet_wrap(enquo(bywhat)) # I don't understand why enquo works here
+              
+              }
+
+#When I examine a variety of dialogue factors, especially density, average_length, question and explanation ratios, something is very different in the later seasons, 13 and 14; unique words looks different in seasons 1 and 2
+
+#For an analysis of episodes I might need to bin 'early and late' somehow, depending on the season and total number of episodes in the season
+
+
+#season 8 doesn't have an episode 7!
+#https://en.wikipedia.org/wiki/The_Bleakening
+
+ bbdat %>% 
+     group_by(season) %>% 
+     mutate(avg_avglgth = mean(avg_length), 
+            var_sentvar = var(sentiment_variance),
+            avg_sentvar = mean(sentiment_variance),
+            med_uniquewds = median(unique_words),
+            gmean_quest = exp(log(question_ratio)),
+            gmean_exclam = exp(log(exclamation_ratio)),
+     ) %>% 
+     filter(episode==1) %>% 
+     ggplot(., aes(x=season)) +
+        geom_line(aes(y=gmean_quest))
+
+ #Patterns across seasons
+ bbdat %>% 
+    group_by(season) %>% 
+    mutate(avg_avglgth = mean(avg_length), 
+           med_uniquewds = median(unique_words),
+           var_sentvar = var(sentiment_variance),
+           avg_sentvar = mean(sentiment_variance),
+           med_uniquewds = median(unique_words),
+           gmean_quest = exp(log(question_ratio)),
+           gmean_exclam = exp(log(exclamation_ratio)),
+    ) %>% 
+    filter(episode==1) %>% 
+    ggplot(., aes(x=season)) +
+    geom_line(aes(y=gmean_exclam, color = 'Geometric Mean of ! Ratio')) +
+    geom_line(aes(y=gmean_quest, color = 'Geometric Mean of ? Ratio'))
+ 
+ 
+ #more variables patterns across seasons
+ bbdat %>% 
+    group_by(season) %>% 
+    mutate(avg_avglgth = mean(avg_length), 
+           med_avglgth = median(avg_length),
+           avg_uniquewds = mean(unique_words),
+           var_sentvar = var(sentiment_variance),
+           avg_sentvar = mean(sentiment_variance),
+           med_uniquewds = median(unique_words),
+           gmean_quest = exp(log(question_ratio)),
+           gmean_exclam = exp(log(exclamation_ratio)),
+    ) %>% 
+    ungroup() %>% 
+    filter(episode==1) %>% 
+    ggplot(., aes(x=season)) +
+    geom_line(aes(y=med_avglgth, color = 'Median avg_length')) +
+    geom_line(aes(y=avg_avglgth, color = 'Average avg_length')) +   scale_x_continuous(breaks = scales::breaks_width(1))
+ 
+ 
+#Seasons 13 and 14, the average length goes down a lot but the amount of unique words does not. Similarly, the use of exclamations and question marks goes down alot. Sentiment variance really doesn't change much
+```
+
+```{r episodeanalysis, echo=FALSE}
+ #Natural breaks for episode, coding with the help of rtutor.ai
+ season_list <-bbdat %>% 
+    group_by(season) %>% 
+    group_split() 
+ 
+ # Function to calculate Jenks breaks and categorize episodes
+categorize_episodes <- function(season_data) {
+     breaks <- getJenksBreaks(season_data$episode, k = 4)
+     season_data <- season_data %>%
+         mutate(episode_cat = case_when(
+             episode <= breaks[2] ~ "early",
+             episode <= breaks[3] ~ "middle",
+             TRUE ~ "late"
+         ))
+     return(season_data)
+ }
+ 
+# Apply the function to each season in the list
+categorized_seasons <- lapply(season_list, categorize_episodes)
+bbdat_cat <- bind_rows(categorized_seasons) %>% 
+              mutate(episode_cat = as_factor(episode_cat))
+
+# looking at any patterns, such as unique_words
+bbdat_cat %>% 
+    mutate(season = as_factor(season)) %>% 
+               ggplot(., aes(unique_words, fill=season)) +
+                geom_histogram() +
+                facet_wrap(~episode_cat)
+bbdat_cat %>% 
+    mutate(season = as_factor(season)) %>% 
+               ggplot(., aes(exclamation_ratio, fill=season)) +
+                geom_histogram() +
+                facet_wrap(~episode_cat)
+
+#distributions for sentiment variance
+ggplot(bbdat_cat, aes(y=sentiment_variance, color=episode_cat)) +
+    geom_boxplot() +
+    facet_wrap(~season)
+
+#Only looks like season 2 was unusual in the middle of the season
+bbdat_cat %>% 
+  mutate(quest_ratnorm = question_ratio/dialogue_density,
+         exclam_ratnorm = exclamation_ratio/dialogue_density) %>% 
+        ggplot(., aes(y=quest_ratnorm, color=episode_cat)) +
+          geom_boxplot() +
+          facet_wrap(~season)
+
+
+```
+
+## Normalize the question ratio and the exclamation ratios for non-blank lines
+```{r dividingbyblanks, echo=FALSE}
+
+ bbdat %>% 
+    group_by(season) %>% 
+    mutate(avg_avglgth = mean(avg_length), 
+           med_avglgth = median(avg_length),
+           avg_uniquewds = mean(unique_words),
+           var_sentvar = var(sentiment_variance),
+           avg_sentvar = mean(sentiment_variance),
+           med_uniquewds = median(unique_words),
+           gmean_quest = exp(log(question_ratio/dialogue_density)), #trying to take away the effect of blanks
+           gmean_exclam = exp(log(exclamation_ratio/dialogue_density)), #trying to take away the effect of blanks
+    ) %>% 
+    ungroup() %>% 
+    filter(episode==1) %>% 
+    ggplot(., aes(x=season)) +
+    geom_line(aes(y=gmean_quest, color = 'Gmean Question')) +
+    geom_line(aes(y=gmean_exclam, color = 'Gmean Exclamation')) +   
+  scale_x_continuous(breaks = scales::breaks_width(1))
+
+
+```
+
+```{r magickprep, echo=FALSE}
+bb_logo <- image_read_svg('https://upload.wikimedia.org/wikipedia/commons/4/4c/Bob%27s_Burgers_logo.svg')
+
+add_logo <- function(plot_path, logo_path, logo_position, logo_scale = 2){
+
+    # Requires magick R Package https://github.com/ropensci/magick
+
+    # Useful error message for logo position
+    if (!logo_position %in% c("top right", "top left", "bottom right", "bottom left")) {
+        stop("Error Message: Uh oh! Logo Position not recognized\n  Try: logo_positon = 'top left', 'top right', 'bottom left', or 'bottom right'")
+    }
+
+    # read in raw images
+    plot <- magick::image_read(plot_path)
+    logo_raw <- magick::image_read(logo_path)
+
+    # get dimensions of plot for scaling
+    plot_height <- magick::image_info(plot)$height
+    plot_width <- magick::image_info(plot)$width
+
+    # default scale to 1/10th width of plot
+    # Can change with logo_scale
+    logo <- magick::image_scale(logo_raw, as.character(plot_width/logo_scale))
+
+    # Get width of logo
+    logo_width <- magick::image_info(logo)$width
+    logo_height <- magick::image_info(logo)$height
+
+    # Set position of logo
+    # Position starts at 0,0 at top left
+    # Using 0.01 for 1% - aesthetic padding
+
+    if (logo_position == "top right") {
+        x_pos = plot_width - logo_width - 0.01 * plot_width
+        y_pos = 0.01 * plot_height
+    } else if (logo_position == "top left") {
+        x_pos = 0.01 * plot_width
+        y_pos = 0.01 * plot_height
+    } else if (logo_position == "bottom right") {
+        x_pos = plot_width - logo_width - 0.01 * plot_width
+        y_pos = plot_height - logo_height - 0.01 * plot_height
+    } else if (logo_position == "bottom left") {
+        x_pos = 0.1 * plot_width
+        y_pos = plot_height - logo_height - 0.1 * plot_height
+    }
+
+    # Compose the actual overlay
+    magick::image_composite(plot, logo, offset = paste0("+", x_pos, "+", y_pos))
+
+}
+
+```
+
+# Unique words do not affect sentiment variance
+# Unique words do not vary much across the seasons
+# Differences in average length of lines and question and exclamation ratios are marked in seasons 13 & 14
+# Adjusting for non-blank lines changes the Geometric means of questions but not exclamation ratios
+# When examining time within seasons, Season 2 has a visible difference in the middle of the seasons for sentiment variance than other seasons
+
+```{r makingplotsforgif, echo=FALSE}
+gg_record(
+    dir = file.path("/cloud/project", 'recording'),
+    device = 'png',
+    width = 8, 
+    height = 5
+)
+```
+
+```{r plotsplots, echo=FALSE}
+
+#sentvar_p <- 
+  ggplot(bbdat, aes(sentiment_variance, unique_words)) +
+    geom_point() + 
+    labs(title = 'Sentiment Variance vs. Unique Words', x='Unique Words', y= 'Sentiment Variance') 
+
+#uniqwds_season_p <- 
+  ggplot(bbdat, aes(unique_words)) +
+                    geom_histogram(fill='darkblue', color='black') +
+                      geom_text(aes(x = 1570, y = 2, label = "2 part episode \n in season 8"), 
+                      vjust = -1, color = "black") +
+                      labs(title = 'Histogram of All Unique Words', x='Unique Words', y=element_blank())
+
+#unique_wds_p <- 
+                      fctsimple(bbdat, unique_words, season) +
+                  labs(title='Histograms of unique words across seasons 1-14', x='Unique Words')
+
+#gmeans_p <-  
+                      bbdat %>% 
+            group_by(season) %>% 
+             mutate(avg_avglgth = mean(avg_length), 
+                    med_avglgth = median(avg_length),
+                    avg_uniquewds = mean(unique_words),
+                    var_sentvar = var(sentiment_variance),
+                     avg_sentvar = mean(sentiment_variance),
+                     med_uniquewds = median(unique_words),
+                    gmean_quest = exp(log(question_ratio)),
+                    gmean_exclam = exp(log(exclamation_ratio)),
+             ) %>% 
+            ungroup() %>% 
+            filter(episode==1) %>% 
+            ggplot(., aes(x=season)) +
+              geom_line(aes(y=gmean_quest, color = 'Geometric Mean of ? Ratio')) +
+              geom_line(aes(y=gmean_exclam, color = 'Geometric Mean of ! Ratio')) +   
+              scale_x_continuous(breaks = scales::breaks_width(1)) +
+            labs(title='Summary of question and exclamation ratios across seasons', x = 'Seasons', y = 'Geometric means of ratios')
+
+#gmeans_nonblanks_p <- 
+                      bbdat %>% 
+                      group_by(season) %>% 
+                      mutate(gmean_quest = exp(log(question_ratio/dialogue_density)),
+                              gmean_exclam = exp(log(exclamation_ratio/dialogue_density)),
+                             ) %>% 
+                      ungroup() %>% 
+                      filter(episode==1) %>% 
+                      ggplot(., aes(x=season)) +
+                          geom_line(aes(y=gmean_quest, color = 'Geometric Mean of ? Ratio')) +
+                          geom_line(aes(y=gmean_exclam, color = 'Geometric Mean of ! Ratio')) +   
+                          scale_x_continuous(breaks = scales::breaks_width(1)) +
+                          labs(title='Question and Exclamation points across seasons in Non-blank lines', x = 'Seasons', y = 'Geometric means of ratios')
+
+#Sentvar_episodes_p <- 
+                      ggplot(bbdat_cat, aes(y=sentiment_variance, color=episode_cat)) +
+                      geom_boxplot() +
+                      facet_wrap(~season) +
+                      labs(title='Sentiment Variance by Season Timing', y='Sentiment Variance')
+    
+gg_stop_recording()
+```
+
+```{r makegif, echo=FALSE, eval=FALSE}
+#currently I can't get this to work with filepaths
+gg_playback(
+  name = file.path("/cloud/project", "recording", "bobsburgers.gif"),
+  first_image_duration = 12,
+  last_image_duration = 12,
+  frame_duration = .5,
+  image_resize = 900,
+  width = 800,
+  height = 800
+)
+
+```
+
+```{r makegif2, echo=FALSE}
+png_files <- list.files("/cloud/project/recording", pattern = ".*png$", full.names = TRUE)
+gifski(png_files, gif_file = "bb_plot.gif", width = 800, height = 600, delay = 3)
+
+```
+
+
+## This data is very unusual so going the extra step to see if I can clean it
+
+```{r origdesc, echo=FALSE}
+transcript_data <- 
+  bobsburgersR::transcript_data |> 
+  dplyr::mutate(
+    dplyr::across(
+      c(season, episode),
+      as.integer
+    )
+  )
+
+# Calculate metrics. You will have to acknowledge downloading of afinn data if
+# you have not used it before.
+episode_metrics <-
+  transcript_data |>
+  dplyr::filter(!is.na(dialogue)) |>
+  dplyr::summarize(
+    # Basic dialogue metrics
+    dialogue_density = dplyr::n() / max(line),
+    avg_length       = mean(stringr::str_length(dialogue)),
+    
+    # Sentiment analysis - AFINN Sentiment Lexicon
+    sentiment_variance = dialogue |>
+      tibble::tibble(text = _) |>
+      tidytext::unnest_tokens(word, text) |>
+      dplyr::inner_join(tidytext::get_sentiments("afinn"), by = "word") |>
+      dplyr::pull(value) |>
+      var(na.rm = TRUE),
+    
+    # Word and punctuation metrics  
+    unique_words      = dialogue |>
+      # Using boundary() instead of "\\s+" as in the blog results in differences
+      # in unique word counts, since punctuation doesn't get grouped with the
+      # word it touches. See ?stringr::boundary for details. I also converted
+      # all text to lowercase before counting.
+      stringr::str_split(stringr::boundary("word")) |>
+      unlist() |>
+      tolower() |> 
+      dplyr::n_distinct(),
+    question_ratio    = mean(stringr::str_detect(dialogue, "\\?")),
+    exclamation_ratio = mean(stringr::str_detect(dialogue, "!")),
+    .by = c(season, episode)
+  )
+
+```
+
+```{r cleanupattempt, echo=FALSE}
+transcript_data %>% 
+    filter(season==13 & episode==1) %>% 
+    filter(!is.na(raw_text))  %>% 
+    select(season, episode, title, line, raw_text) %>% 
+    mutate(line_new = row_number()) %>% 
+    mutate(followup_line = str_detect(raw_text, '^[-]|^[A-Z]|^[1-9]', negate=TRUE))
+
+#cleaning the transcript data
+transcript_data %>% 
+    filter(season==13 & episode==1) %>% 
+    filter(!is.na(raw_text))  %>% 
+    select(season, episode, title, line, raw_text) %>% 
+    mutate(line_new = row_number()) %>% 
+    mutate(followup_line = str_detect(raw_text, '^[-]|^[A-Z]|[1-9]', negate=TRUE)) %>% 
+    mutate(group = (followup_line == TRUE & lag(followup_line == FALSE)),
+           group2 = if_else(group==FALSE & followup_line==TRUE, TRUE, FALSE), 
+           group3 = (followup_line==FALSE & lead(followup_line==TRUE)),
+           ult_group = (group==TRUE | group2==TRUE),
+           final_group = cumsum(!ult_group==TRUE)) %>% 
+    group_by(season, episode, final_group) %>% 
+    summarise(concatenated_diag = if(any(followup_line)) {
+        paste(raw_text[followup_line==TRUE | (followup_line==FALSE & lead(followup_line==TRUE, default = FALSE))], collapse=" ")
+    } else {
+        first(raw_text)
+        
+    }, .groups = 'drop') 
+
+#possible all cleaning
+transcript_data %>% 
+    filter(season==13 & episode==1) %>% 
+    #group_by(season, episode) %>% 
+    filter(!is.na(raw_text))  %>% 
+    select(season, episode, title, line, raw_text) %>% 
+    mutate(line_new = row_number()) %>% 
+    mutate(followup_line = str_detect(raw_text, '^[-]|^[A-Z]|[1-9]', negate=TRUE)) %>% 
+    mutate(group = (followup_line == TRUE & lag(followup_line == FALSE)),
+           group2 = if_else(group==FALSE & followup_line==TRUE, TRUE, FALSE), 
+           group3 = (followup_line==FALSE & lead(followup_line==TRUE)),
+           ult_group = (group==TRUE | group2==TRUE),
+           final_group = cumsum(!ult_group==TRUE)) %>% 
+    group_by(final_group, add=TRUE) %>% 
+    summarise(concatenated_diag = if(any(followup_line)) {
+        paste(raw_text[followup_line==TRUE | (followup_line==FALSE & lead(followup_line==TRUE, default = FALSE))], collapse=" ")
+    } else {
+        first(raw_text)
+        
+    }, .groups = 'drop') 
+
+#second way of possible all cleaning
+transcript_data2 <- transcript_data %>% 
+    #filter(season==13 & episode==1) %>% 
+    group_by(season, episode) %>% 
+    filter(!is.na(raw_text))  %>% 
+    select(season, episode, title, line, raw_text, dialogue) %>% 
+    mutate(line_new = row_number()) %>% 
+    mutate(followup_line = str_detect(raw_text, '^[-]|^[A-Z]|[1-9]', negate=TRUE)) %>% 
+    mutate(group = (followup_line == TRUE & lag(followup_line == FALSE)),
+           group2 = if_else(group==FALSE & followup_line==TRUE, TRUE, FALSE), 
+           group3 = (followup_line==FALSE & lead(followup_line==TRUE)),
+           ult_group = (group==TRUE | group2==TRUE),
+           final_group = cumsum(!ult_group==TRUE)) %>% 
+    group_by(final_group, .add=TRUE) %>% 
+    mutate(concatenated_diag = if(any(followup_line)) {
+        paste(raw_text[followup_line==TRUE | (followup_line==FALSE & lead(followup_line==TRUE, default = FALSE))], collapse=" ")
+    } else {
+        first(raw_text)
+        
+    } ) %>% 
+        slice(1) %>% 
+  ungroup() %>% 
+    select(-c(group, group2, group3, ult_group, final_group, followup_line)) 
+
+transcript_data3 <- transcript_data %>% 
+    filter(season==13 | season==14) %>% 
+    group_by(season, episode) %>% 
+    filter(!is.na(raw_text))  %>% 
+    select(season, episode, title, line, raw_text, dialogue) %>% 
+    mutate(line_new = row_number()) %>% 
+    mutate(followup_line = str_detect(raw_text, '^[-]|^[A-Z]|[1-9]', negate=TRUE)) %>% 
+    mutate(group = (followup_line == TRUE & lag(followup_line == FALSE)),
+           group2 = if_else(group==FALSE & followup_line==TRUE, TRUE, FALSE), 
+           group3 = (followup_line==FALSE & lead(followup_line==TRUE)),
+           ult_group = (group==TRUE | group2==TRUE),
+           final_group = cumsum(!ult_group==TRUE)) %>% 
+    group_by(final_group, .add=TRUE) %>% 
+    mutate(concatenated_diag = if(any(followup_line)) {
+        paste(raw_text[followup_line==TRUE | (followup_line==FALSE & lead(followup_line==TRUE, default = FALSE))], collapse=" ")
+    } else {
+        first(raw_text)
+        
+    } ) %>% 
+    slice(1) %>% 
+    ungroup() %>% 
+    select(-c(group, group2, group3, ult_group, final_group, followup_line)) %>% 
+    mutate(concatenated_diag = str_remove_all(concatenated_diag, "\\[.*?\\]"))
+
+transcript_data4 <- transcript_data %>% 
+                    mutate(concatenated_diag = dialogue,
+                             line_new = row_number()) %>% 
+                    filter(season<13) %>% 
+                    rbind(., transcript_data3) %>% 
+                    mutate(dialogue = concatenated_diag) %>% #replacing 13 and 14 seasons
+                    filter(!is.na(dialogue))
+
+
+               
+
+```
+
+```{r recodeinfo, echo=FALSE}
+#try to replicate poncet cleaning for TidyTuesday and rerun some stats/visualizations
+transcript_data5 <- transcript_data4 %>% 
+    group_by(season, episode) %>% 
+    summarize( 
+        dialogue_dens_orig = dplyr::n()/max(line),
+        avg_length = mean(stringr::str_length(dialogue)),
+        diaglogue_dens = dplyr::n()/max(line_new)) %>% 
+    ungroup()  
+
+transcpt_new <- left_join(transcript_data4, transcript_data5, by=c('season', 'episode')) %>% 
+                select(-(concatenated_diag)) 
+
+transcpt_new1 <- transcpt_new |>
+                group_by(season, episode) |>
+                mutate(sentiment_variance = dialogue |>
+                        tibble::tibble(text = _)  |> 
+                      tidytext::unnest_tokens(word, text)  |> 
+                      dplyr::inner_join(tidytext::get_sentiments('afinn'), by='word')  |> 
+                      dplyr::pull(value)  |>
+                       var(na.rm = TRUE)
+                ) |>
+                ungroup()
+
+transcpt_new2 <- transcpt_new1 |>
+                mutate(unique_words = dialogue |> 
+                         stringr::str_split(stringr::boundary('word'))|> 
+                         unlist() |>
+                         tolower() |>
+                         dplyr::n_distinct(),
+                         question_ratio = mean(stringr::str_detect(dialogue, "\\?")),
+                          exclamation_ratio = mean(stringr::str_detect(dialogue, "!")),
+                       .by = c(season, episode)) |>
+                select(-c(raw_text, line, line_new, dialogue)) |>
+                group_by(season, episode) |>
+                slice(1) |>
+                ungroup()
+#For now just removing the unique_words metric
+bbdat2 <- bbdat %>% 
+          select(season, episode, unique_words)
+
+bbdat2 <- transcpt_new2 %>% 
+          select(-c(unique_words)) %>% 
+          left_join(., bbdat2, by = c('season', 'episode'))
+
+```
+
+
+```{plots_withnew, echo=FALSE}
+
+
+```
