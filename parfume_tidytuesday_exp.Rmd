@@ -1,0 +1,404 @@
+---
+title: "TidyTuesday_Dec"
+output: html_document
+date: "2024-12-09"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries}
+library(usethis)
+library(tidytuesdayR)
+library(tidyverse)
+library(gt)
+library(gtsummary)
+library(ggplot2)
+library(janitor)
+#library(sf)
+library(BAMMtools)
+library(magick)
+library(camcorder)
+library(gifski)
+library(quanteda)
+library(tidytext)
+library(naniar)
+library(wordcloud2)
+library(classInt)
+library(ggbump)
+library(gganimate)
+
+```
+
+## Load Data
+
+
+```{r getdata, echo=FALSE}
+pfdattdyr <- tidytuesdayR::tt_load('2024-12-10') 
+
+pf_dat1 <-pfdattdyr$parfumo_data_clean %>% 
+        clean_names()
+
+#After data exploration these data are not really clean. Most of the numbers are not unique identifiers nor do perfumes have them
+#Secondly, there are 10 records with repeated columnames
+
+pf_dat <- pf_dat1 %>% 
+            filter(brand!='Brand')
+
+
+```
+
+
+## Explore missingness
+
+```{r exp1, echo=FALSE}
+
+#full records - but missing numbers
+pf_dat %>% 
+    filter(if_all(c(release_year, concentration, rating_value, main_accords, top_notes, middle_notes, base_notes), ~!is.na(.)))
+
+#records to throw out due to not having valuable information
+pf_dat %>% 
+    filter(if_all(c(release_year, concentration, rating_value, main_accords, top_notes, middle_notes, base_notes), ~is.na(.)))
+
+gg_miss_var(pf_dat)
+
+```
+
+# Which brands have the most missing data on parfumo?
+
+```{r missinginfo, echo=FALSE}
+pf_dat %>% 
+    filter(if_all(c(release_year, concentration, rating_value, main_accords, top_notes, middle_notes, base_notes), ~is.na(.))) %>% 
+    group_by(brand) %>% 
+    add_count() %>% 
+    ungroup() %>% 
+    filter(n>10) %>% 
+    arrange(desc(n)) %>% 
+    select(number, name, brand, url, n)
+
+#The top 25 brands missing data on parfumo
+pf_dat %>% 
+    filter(if_all(c(release_year, concentration, rating_value, main_accords, top_notes, middle_notes, base_notes), ~is.na(.))) %>% 
+    count(brand) %>% 
+    arrange(desc(n)) %>% 
+    print(n=25)
+
+topmiss <-pf_dat %>% 
+    filter(if_all(c(release_year, concentration, rating_value, main_accords, top_notes, middle_notes, base_notes), ~is.na(.))) %>% 
+    count(brand) %>% 
+    arrange(desc(n)) %>% 
+    top_n(25) %>% 
+    pull(brand)
+
+
+```
+
+
+## Categories of notes
+### Floral, herb, spice, fruit(citrus, tree), Spirits(whiskey), wood, 
+### 'which includes woody, floral, amber, and fresh'
+
+```{r exp2,echo=FALSE}
+pf_dat %>% 
+    filter(if_all(c(top_notes, middle_notes, base_notes), ~!is.na(.))) %>% 
+    select(release_year, main_accords, top_notes, middle_notes, base_notes) %>% 
+    filter(if_all(c(main_accords, release_year), ~!is.na(.)))
+# Some reading
+## https://odeuropa.eu/objectives-timeline/
+
+```
+
+# what is the timeline of the release years?
+```{r timeexp, echo=FALSE}
+pf_dat %>% 
+    filter(!is.na(main_accords)) %>% 
+    count(release_year) %>%
+    ggplot(aes(x = release_year, y = n)) +
+    ylim(0,1750) +
+    geom_line() +
+    geom_point() +
+    labs(title = "Timeline of Year Counts", x = "Year", y = "Count")
+
+#data goes from 1709 to 2024 but 2024 is not 'complete'
+
+```
+
+# Words and their exploration
+```{r olfacttextexp, echo=FALSE}
+word_counts_accords <- pf_dat %>%
+    filter(!is.na(main_accords)) %>% 
+    select(main_accords) %>%
+    tidytext::unnest_tokens(word, main_accords) %>%
+    count(word, sort = TRUE)
+
+#there are perfumes with notes listed WITHOUT main accords
+
+```
+
+# What are the brand affiliations with different perfumers?
+
+```{r brandperfumer, echo=FALSE}
+pf_dat %>% 
+    filter(!is.na(perfumers)) %>% 
+    select(brand, perfumers) %>% 
+    distinct() %>% 
+    arrange(brand)
+
+
+pf_dat %>% 
+    filter(!is.na(perfumers)) %>% 
+    select(perfumers, brand) %>% 
+    group_by(perfumers, brand) %>% 
+    distinct() %>% 
+    add_count() %>% 
+    ungroup() %>% 
+    arrange(desc(n)) %>% 
+    count(perfumers) %>% 
+    arrange(desc(n))
+
+#Alberto Morillas seems to be most prolific in terms of numbers of perfumes on this list and numbers of brands hes worked with, 
+#Julien Bedel appears to be second in numbers of perfumes but not in the top 25 for perfumers
+
+#Another way to slice the data is 'Brand owner, Perfume maker' in the Perfumers slot
+
+```
+
+# Making a word cloud of main accords over the years
+```{r textmineaccords, echo=FALSE}
+#break up the dataset into natural breaks on years
+#correctly 
+# Assuming you want to plot Jenks breaks for the 'dis' variable
+pf_dat2 <- pf_dat %>% 
+     filter(!is.na(main_accords) & !is.na(release_year))
+
+#jenks_breaks <- classInt::classIntervals(pf_dat2$release_year, n = 10, style = "jenks")$brks
+
+# Create a new factor variable based on Jenks breaks this is not currently working due to computing
+#pf_dat2$year_jenks <- cut(pf_dat2$release_year, breaks = jenks_breaks, include.lowest = TRUE)
+
+pf_dat2$year_brks <- cut(pf_dat2$release_year, breaks = c(1700,1900,1925,1950,1975,1985,1995,2000, 2005, 2010, 2015, 2020, 2025), include.lowest = TRUE)
+
+# Rtutor for the map code
+# Create a list of datasets for each model year
+release_year_datasets <- pf_dat2 %>%
+  group_by(year_brks) %>%
+  group_split()
+
+
+
+#Function to create dataframes with ranks of the words
+create_worddata <- function(data) {
+  word_data <- data %>%
+    select(main_accords) %>%
+    tidytext::unnest_tokens(word, main_accords) %>%
+    count(word, sort = TRUE) %>% 
+    arrange(desc(n)) %>% 
+    mutate(rank = seq_len(nrow(.)))
+
+}
+
+wordcounts <-map(release_year_datasets, create_worddata)
+
+# Function to create a word cloud for each dataset
+create_wordcloud <- function(data) {
+  word_data <- data %>%
+    select(main_accords) %>%
+    tidytext::unnest_tokens(word, main_accords) %>%
+    count(word, sort = TRUE)
+  
+  set.seed(100)
+  
+  wordcloud2(word_data) + WCtheme(1)
+}
+
+# Apply the wordcloud function to each dataset
+wordclouds <- map(release_year_datasets, create_wordcloud)
+
+# Display the word clouds
+wordclouds
+
+
+```
+
+#Need to detect the differences between datasets
+```{r diff, echo=FALSE}
+
+
+```
+
+#Using a bump chart for the changes, hopefully 20 is not too much
+```{r bumptrialdat, echo=FALSE}
+years_label <- data.frame(label = levels(pf_dat2$year_brks), value=1:length(levels(pf_dat2$year_brks)))
+wordcounts_df <- bind_rows(wordcounts, .id = 'group_id') %>%
+                mutate(group_id = as.integer(group_id)) %>% 
+                left_join(., years_label, by=c('group_id'='value')) %>% 
+                mutate(year_brks = factor(as_factor(label), ordered = TRUE)) %>% #forcing an ordered factor to use max and min in plots
+                select(-c(label, group_id)) %>% 
+                select(year_brks, everything())
+
+```
+
+```{r bumptrial, echo=FALSE, eval=FALSE}
+#This is quite interesting but with 20+ colors, this is not easy to tell what it is
+ggplot(wordcounts_df, aes(year_brks, rank, group = word, color=word)) +
+    geom_bump() +
+    scale_y_reverse()
+
+#let's try labels
+ggplot(wordcounts_df, aes(year_brks, rank, group = word, color=word)) +
+    geom_bump() +
+    scale_y_reverse() +
+ geom_text(data = wordcounts_df %>% filter(year_brks == min(year_brks)), 
+            aes(label = word), 
+            hjust = 1, 
+            nudge_x = -0.2) +
+  geom_text(data = df %>% filter(year_brks == max(year_brks)), 
+            aes(label = word), 
+            hjust = 0, 
+            nudge_x = 0.2) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+#New and improved thanks to rtutor.ai
+ggplot(wordcounts_df, aes(year_brks, rank, group = word, color=word)) +
+    geom_bump() +
+    scale_y_reverse() +
+    geom_text(data = wordcounts_df %>% filter(year_brks == min(year_brks)), 
+              aes(label = word), 
+              hjust = 1, 
+              nudge_x = -0.2) +
+    geom_text(data = wordcounts_df %>% filter(year_brks == max(year_brks)), 
+              aes(label = word), 
+              hjust = 0, 
+              nudge_x = 0.2) +
+    coord_cartesian(xlim = c(0.5, length(levels(wordcounts_df$year_brks)) + 0.5)) +
+    theme_minimal() +
+    theme(legend.position = "none") 
+
+#trying with manual shapes
+ggplot(wordcounts_df, aes(year_brks, rank, group = word, color=word)) +
+    geom_bump() +
+    scale_y_reverse() +
+    geom_point(aes(shape=word)) +
+    scale_shape_manual(values=seq(0,22)) +
+    geom_text(data = wordcounts_df %>% filter(year_brks == min(year_brks)), 
+              aes(label = word), 
+              hjust = 1, 
+              nudge_x = -0.2) +
+    geom_text(data = wordcounts_df %>% filter(year_brks == max(year_brks)), 
+              aes(label = word), 
+              hjust = 0, 
+              nudge_x = 0.2) +
+    coord_cartesian(xlim = c(0.5, length(levels(wordcounts_df$year_brks)) + 0.5)) +
+    theme_minimal() +
+    theme(legend.position = "none") 
+
+```
+
+
+#could possibly also animate the rankings of the words across the year breaks using gganimate
+
+```{r animatemainaccords, echo=FALSE, eval=FALSE}
+
+'! time data must either be an integer, numeric, POSIXct, Date, difftime, or hms object'
+
+
+#I think to get geom_bump to work with gganimate need to convert to a time period and then use transition events or transition time
+
+bumpp <-ggplot(wordcounts_df, aes(year_brks, rank, group = word, color=word)) +
+    geom_bump() +
+    scale_y_reverse() +
+    geom_point(aes(shape=word)) +
+    scale_shape_manual(values=seq(0,22)) +
+    geom_text(data = wordcounts_df %>% filter(year_brks == min(year_brks)), 
+              aes(label = word), 
+              hjust = 1, 
+              nudge_x = -0.2) +
+    geom_text(data = wordcounts_df %>% filter(year_brks == max(year_brks)), 
+              aes(label = word), 
+              hjust = 0, 
+              nudge_x = 0.2) +
+    coord_cartesian(xlim = c(0.5, length(levels(wordcounts_df$year_brks)) + 0.5)) +
+    theme_minimal() +
+    theme(legend.position = "none") +
+    transition_reveal(year_brks, transition_length = 2, state_length = 1, wrap=FALSE)
+    enter_fade() +
+    exit_fade()
+
+# Render the animation
+animate(bumpp, nframes = 100, fps = 10)
+
+
+```
+
+#Building the animation from scratch
+```{r animationscratch, echo=FALSE}
+
+brks <- levels(wordcounts_df$year_brks)
+
+#takes a list from a vector and starts there
+create_dfs <- function(data, value) {
+  
+    df <-data %>%
+     mutate(word = ifelse(year_brks>value, NA, word),
+            rank = ifelse(year_brks>value, NA, rank)) 
+    return(df)
+
+  }
+
+vec_int <- brks[2:length(brks)] # taking the second value of the vector and running the datasets to the end
+seq_dfs <-map(vec_int, ~create_dfs(wordcounts_df, .x))
+
+
+
+
+makeplots <- function(df) {
+  ggplot(df, aes(year_brks, rank, group = word, color=word)) +
+    geom_bump() +
+    scale_y_reverse(breaks = seq(1,21, by=1)) +
+    geom_point(aes(shape=word)) +
+    scale_shape_manual(values=seq(0,22)) +
+    geom_text(data = df %>% filter(year_brks == min(year_brks)), 
+              aes(label = word), 
+              hjust = 1, 
+              nudge_x = -0.2) +
+    geom_text(data = df %>% filter(!is.na(word)) %>% filter(year_brks==max(year_brks)), 
+              aes(label = word), 
+              hjust = 0, 
+              nudge_x = 0.2) +
+    coord_cartesian(xlim = c(0.5, length(levels(wordcounts_df$year_brks)) + 0.5)) + #not the best function line it calls external dataset
+    theme_minimal() +
+    theme(legend.position = "none") +
+    labs(
+    title = "Rank of Main Accords for Parfumes by Release Year",
+    subtitle = "Often Floral and Spicy, recently, Sweet",
+    caption = "Each parfume may have multiple main accords noted \n Data source:Parfumo via https://www.kaggle.com/olgagmiufana1",
+    x = 'Year of Release (binned)'
+  )
+  
+}
+
+plotspack <- map(seq_dfs, makeplots)
+
+```
+
+```{r makegif, echo=FALSE}
+gg_record(
+    dir = file.path("/cloud/project", 'recording2'),
+    device = 'png',
+    width = 12, 
+    height = 6
+)
+
+plotspack
+
+gg_stop_recording()
+
+png_files <- list.files("/cloud/project/recording2", pattern = ".*png$", full.names = TRUE)
+gifski(png_files, gif_file = "pf_plot.gif", width = 1200, height = 600, delay = 2)
+
+
+
+```
