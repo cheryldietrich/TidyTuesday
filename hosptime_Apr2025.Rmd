@@ -1,0 +1,1151 @@
+---
+title: "Time_hosp_Apr2025"
+
+date: "2025-04-11"
+
+output:
+  html_document:
+    toc: true            # Include table of contents
+    toc_depth: 2         # Number of heading levels to include
+    number_sections: true
+    theme: cosmo         # Bootstrap theme: cosmo, flatly, united, etc.
+    highlight: tango     # Syntax highlighting style
+    df_print: paged      # Interactive tables
+    css: styles.css      # Optional: custom CSS file
+    self_contained: true # Embeds everything in one file
+
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries, message=FALSE}
+library(usethis)
+library(dplyr)
+library(tidytuesdayR)
+library(tidyverse)
+#library(cancerprof) - need to put in directly from github but not reloaded automatically so may need new codeblock for reproducibility
+library(tidycensus)
+library(broom)
+library(plotly)
+library(gt)
+library(gtsummary)
+library(ggplot2)
+library(janitor)
+library(sf)
+library(tigris)
+library(naniar)
+#library(usmap)  # for simple state mapping (need above)
+library(ggthemes)  # optional, for prettier maps (need above
+
+options(tigris_use_cache = TRUE)
+
+```
+
+# Data
+
+## Data Load
+
+```{r data, echo=FALSE}
+hospdata <- tidytuesdayR::tt_load('2025-04-08')
+
+hosp_dat <- hospdata$care_state
+```
+
+## Data Exploration
+
+```{r dat_exp1, echo=FALSE, results='hide'}
+#earliest date and latest date
+
+range(hosp_dat$start_date)
+range(hosp_dat$end_date)
+
+hosp_dat2 <- hosp_dat %>% 
+            mutate(measure_len = days(end_date-start_date))
+
+#Need to see the range between these given earliest start date is Jan 2023 and earliest end dat is December 2023 (a year apart)
+#But for 2024 there's only a quarter - latest start date is Jan 2024 and latest end date is end of March 2024
+
+#Getting a spread error with tabyl
+hosp_dat2 %>% 
+    filter(measure_len>days(90) & measure_len<days(364)) %>% 
+    tabyl(measure_name)
+
+# Measure names
+hosp_dat %>% 
+    group_by(measure_name) %>% 
+    count() %>% 
+    print(n=21)
+
+hosp_dat %>% 
+    filter(measure_name=='Average time patients spent in the emergency department before being sent home A lower number of minutes is better (high)') %>% 
+    select(measure_name, measure_id)
+#There's an OP_18b_HIGH_MIN & OP_18b_VERY_HIGH_MIN for this
+
+
+```
+
+```{r data_exp2, results='hide'}
+
+#we need to group the averages versus the percentages
+#There's Sepsis and Opioid prescription measures which are percentages which are not labeled as percentages
+# conditions are the themes for the types of measures
+hosp_dat3 <- hosp_dat2 %>% 
+            mutate(typenum = case_when(
+              str_detect(measure_name, '[Aa]verage') ~ 'avg', 
+              str_detect(measure_name, '[Pp]ercentage|Safe\\sUse|Septic\\sShock|Severe\\sSepsis') ~ 'pct', 
+              TRUE ~ NA
+            ))
+
+#Explore if anything has time for different measures
+hosp_dat3 %>% 
+    mutate(time_var = time_length(measure_len, unit='days')) %>% 
+    group_by(measure_name) %>% 
+   summarise(min_time = min(time_var, na.rm = TRUE),
+             max_time = max(time_var, na.rm = TRUE)) %>% 
+    filter(max_time!=min_time)
+#alternatively:
+hosp_dat3 %>% 
+    mutate(time_var = time_length(measure_len, unit='days')) %>% 
+    group_by(measure_name) %>% 
+   reframe(ran_var = range(time_var, na.rm=TRUE)) %>% 
+    print(n=42)
+#So regardless of the measure the duration of the measure is the same
+
+#There is some hard to interpret measures such as avg time spent in ED before being sent home with different 'levels' in parentheses but there's not really an explanation for this
+hosp_dat3 %>% 
+    filter(condition=='Emergency Department' & typenum=='avg') %>% 
+    group_by(measure_name) %>% 
+    summarise(median_scr = median(score, na.rm = TRUE))
+hosp_dat3 %>% 
+    filter(str_detect(measure_id, '^OP_?.*MIN?.*')) %>% 
+    group_by(measure_id) %>% 
+    reframe(min_score = min(score, na.rm=TRUE),
+            max_score = max(score, na.rm = TRUE))
+
+#it might be good just to use the 'raw' score of OP_18b and OP_18c because these categories are hard to discern
+#The categories of LOW, MEDIUM, HIGH, and VERY HIGH are a bit hard to understand in these data. Those with very low scores don't have a 'very high' but those with the maximum score for 18b of 310 don't have a 
+
+#18b and 18c seem to contain others
+#Sep_1 may contain Sep_SH_3HR; sep_SH_6hr; SEV_sep_3hr; SEV_SEP_6HR
+hosp_dat3 %>% 
+    filter(str_detect(measure_id, '.*SEP_?.*')) %>% 
+    select(state, condition, measure_id, score) %>% 
+    pivot_wider(id_cols = state, names_from = measure_id, values_from=score)
+```
+
+## Preliminary Plots
+
+
+```{r state_explore, echo=FALSE, warning=FALSE, message=FALSE}
+#explore the values for Percentage measures
+hosp_dat3 %>% 
+  filter(typenum=='pct') %>% 
+  ggplot(aes(x=state, y=score, color=measure_id)) +
+           geom_point()
+
+#explore the values for absolute measures
+hosp_dat3 %>% 
+    filter(typenum=='avg') %>% 
+    ggplot(aes(x=state, y=score, color=measure_id)) +
+          geom_point()
+
+
+```
+
+## Import outside data
+```{r datpop, warning=FALSE, message=FALSE}
+#2020 state population data
+cen_totpop <- tidycensus::get_decennial('state', year=2020, variables = 'P1_001N')
+
+
+# income and poverty levels
+vars <- c(
+  median_inc = "B19013_001",
+  per_capita_inc = "B19301_001",
+  gini_ind = "B19083_001",
+  poverty_ct = "B17001_002",
+  poverty_tot = "B17001_001"
+)
+
+#Note that the variables ending in 'E' are Estimates and the variables ending in 'M' are 'Margins of Error' when selecting 'wide'
+acs_incdat <- get_acs(
+  geography = "state",
+  variables = vars,
+  survey = "acs5",
+  year = 2022,
+  output = "wide"
+)
+
+#land area of the states
+
+state_area_data <- readr::read_tsv('2024_Gaz_state_national.txt')
+
+#Overdose data in the states?
+ovrdose_st <- read_csv('drug_mortality_bystate_2022.csv')
+
+ovrdose_st2 <- ovrdose_st %>% 
+                filter(YEAR==2022) %>% 
+                mutate(STATE = case_when(
+                  STATE=='District of Columbia' ~ 'DC',
+                  TRUE ~ STATE
+                )) %>% 
+                  select(-c(URL)) %>% 
+                  rename(Rate_per_100k = RATE,
+                         Year_dat = YEAR,
+                         Overdose_deaths = DEATHS,
+                         state = STATE)
+```
+
+## Potential additional descriptive analyses
+```{r add_analysese, echo= FALSE, warning=FALSE}
+#18b/18c - time to be seen ER(before leaving) over PYSCH time to release
+hosp_dat3 %>% 
+    filter(str_detect(measure_id, '18_?.*')) %>% 
+    select(state, condition, measure_id, score) %>% 
+    pivot_wider(id_cols = state, names_from = measure_id, values_from=score) %>% 
+    mutate(EDtoPsych_time = OP_18b/OP_18c) %>% 
+    ggplot(.) +
+        geom_point(aes(x=state, y=EDtoPsych_time)) + 
+        ggtitle('Time in the ER over time in the ER for Psychiatric cases by State')
+
+#OP_22 % who left ED before being seen overlay
+#this currently is a little misleading. OP_22% is converted to a decimal and the OP_18b/18c is a ratio
+hosp_dat3 %>% 
+    filter(str_detect(measure_id, '18_?.*|^OP_22$')) %>% 
+    select(state, condition, measure_id, score) %>% 
+    pivot_wider(id_cols = state, names_from = measure_id, values_from=score) %>% 
+    mutate(EDtoPsych_time = OP_18b/OP_18c,
+           OP_22_pct = (OP_22/100)) %>% 
+    ggplot(aes(x=state)) +
+        geom_col(aes(y=EDtoPsych_time), alpha=0.5) +
+        geom_point(aes(y=OP_22_pct)) +
+        ggtitle('Ratio of Time in ER/Pysch Patient Time in ER + Percentage of patients who left before being seen', 'presented by State/Territory')
+        
+
+#There is a small pattern where the percentage of people who leave might be correlated to the number of hours it takes in the ED. There are 12 states where the percentage of people who leave is larger than the number of hours in the ED
+hosp_dat3 %>% 
+    filter(str_detect(measure_id, '18_?.*|^OP_22$')) %>% 
+    select(state, condition, measure_id, score) %>% 
+    pivot_wider(id_cols = state, names_from = measure_id, values_from=score) %>% 
+    mutate(EDtoPsych_time = OP_18b/OP_18c,
+           OP_18b_hr = OP_18b/60)%>% 
+          # OP_22_pct = (OP_22/100)) %>% 
+    filter(round(OP_18b_hr, 0)<round(OP_22, 0)) %>% 
+
+    ggplot(aes(x=state)) +
+        geom_col(aes(y=OP_18b_hr), alpha=0.5) +
+        geom_point(aes(y=OP_22)) +
+        ggtitle('12 States where Percentage of People who Leave before being Seen is Larger than number of Hours in the Emergency Department')
+
+
+#OP_23 % ED stroke symptoms & brain scan (appropriate ED care)
+
+#OP_29 % appropriate rec for follow-up colonoscopy
+#OP_31 % cataract surgery and improvement in vision
+
+```
+
+### Exploring data for 3 vs. 6 hour bundles
+```{r exploration2, warning=FALSE}
+#SEP_SH_3HR vs. SEP_SH_6HR; SEV_SEP_3HR vs. SEV_SEP_6HR
+#3hr vs. 6 hr bundles for sepsis 
+hosp_dat3 %>% 
+    filter(str_detect(measure_id, '.*SEP_?.*')) %>% 
+    select(state, condition, measure_id, score) %>% 
+    pivot_wider(id_cols = state, names_from = measure_id, values_from=score) %>% 
+    mutate(thrvssix_shock = (SEP_SH_6HR-SEP_SH_3HR)/SEP_SH_3HR,
+           thrvssix_svr = (SEV_SEP_6HR - SEV_SEP_3HR)/SEV_SEP_3HR
+    ) 
+```
+
+### Overdoses to correct opioid prescribing. Here, the data on overdose is the year to year and a half prior to the prescribing standards measure in the dataset
+```{r overdoseviz, echo=FALSE}
+
+hosp_dat3 %>% 
+    filter(measure_id=='SAFE_USE_OF_OPIOIDS') %>% 
+    left_join(., ovrdose_st2, by='state') %>% 
+    ggplot(.) + 
+      geom_line(aes(x=Rate_per_100k, y=score)) +
+      ggtitle('Prescribing practices by prior year opioid deaths')
+      
+      
+```
+
+### Not many descriptive patterns except very high overdose rates in DC and WV but not in others with similar scores. Lower than Median scores in 2023-2024 but more than median drug overdoses in 2022
+
+```{r moreopioid_tab, echo=FALSE}
+hosp_dat3 %>% 
+         filter(measure_id=='SAFE_USE_OF_OPIOIDS') %>% 
+         left_join(., ovrdose_st2, by='state') %>% 
+         mutate(med_score_opioid = median(score, na.rm=TRUE),
+                med_rate_ovrdose = median(Rate_per_100k, na.rm=TRUE)) %>%              
+            filter(score<15 & Rate_per_100k>med_rate_ovrdose)
+
+```
+
+# PCA with ranked variables
+
+First states or variables without informative data, enough data or no data are dropped from these analyses. Many of the territories had no data. Additionally OP_31 was only present for 12 states.
+
+The data consists of a mix of higher is better and lower is better, as well as absolute and percentage scores. Here, the 'lower is better scores', OP_22, SAFE_USE_OF_OPIOIDS, OP_18b, and OP18c are flipped.
+```{r notes, echo=FALSE, warning=FALSE}
+#Percentage measure where high is good
+#IMM_3: Healthcare workers given influenza vaccination is percentage
+#OP_23 (ED); OP_29 & OP_31; SEP_1 (ICU or ED)
+
+#Lower is better percentage: OP_22, SAFE_USE_OF_OPIOIDS
+#Lower is better absolute time; OP_18b; OP_18c 
+
+```
+
+
+```{r var_datprep, echo= FALSE}
+## Edited ChatGPT with reference text 
+#Rank PCA analysis of the percentage measures
+#Reference: https://pca4ds.github.io/analysis-of-table-of-ranks.html
+
+
+hosp_dat4 <- hosp_dat3 %>% 
+    select(state, measure_id, score) %>% 
+    filter(measure_id %in% c('IMM_3', 'OP_23', 'OP_29', 'SEP_1', 'OP_22', 'OP_18b', 'OP_18c', 'SAFE_USE_OF_OPIOIDS')) %>% 
+    pivot_wider(id_cols = state, names_from = measure_id, values_from=score) %>% 
+    filter(if_any(-state, ~ !is.na(.)))  # Filter out those territories with really no data
+
+
+# Step 1: Identify which variables are time-like (lower is better)
+reverse_vars_time <- c('OP_18b', 'OP_18c') 
+reverse_vars_pct <- c('SAFE_USE_OF_OPIOIDS', 'OP_22')# Lower is better
+id_var <- "state"  # Column with categorical IDs
+
+# Step 2: Flip the time variables (make lower = better variables "higher")
+hospdat_flipped <- hosp_dat4 %>%
+  mutate(across(all_of(reverse_vars_time), ~ max(., na.rm = TRUE) - .)) %>% 
+  mutate(across(all_of(reverse_vars_pct), ~ 100 - .)) # Flip the percentage variables
+```
+
+## The first analysis is a PCA of the covariance matrix of ranked scores.
+
+```{r rank_PCAcor, warning=FALSE, message=FALSE}
+# Step 3: Rank all numeric variables (but keep the ID variable as it is)
+hosp_ranked <- hospdat_flipped %>%
+  mutate(across(where(is.numeric), ~rank(-., ties.method = "min"))) #giving lower ranks to higher scores and handling ties as the minimum possible rank and same values
+
+# Step 4: Extract numeric data (for PCA) and drop the ID variable (State)
+ranked_numeric <- hosp_ranked %>%
+  select(-all_of(id_var)) #syntax is a bit weird for one variable but needed since I'm calling an external vector
+
+# Step 5: Compute Spearman correlation matrix
+cor_matrix <- cor(ranked_numeric, method = "spearman")
+
+# Step 6: Perform PCA
+pca_result <- prcomp(cor_matrix, center = TRUE, scale. = TRUE)
+
+```
+
+### Visualizing the variance with a screeplot:
+
+```{r screeplotcorr, echo=FALSE}
+screeplot(pca_result, type = "lines", main = "Scree Plot")
+
+```
+
+### Additionally looking at the Principle Components (PCs) explaining the variance
+
+```{r eigenvalues, warning=FALSE}
+# Step 7a: View eigenvalues and % variance explained
+eigenvalues <- pca_result$sdev^2
+prop_variance <- eigenvalues / sum(eigenvalues)
+cum_variance <- cumsum(prop_variance)
+
+variance_explained <- data.frame(
+  PC = paste0("PC", 1:length(eigenvalues)),
+  Eigenvalue = eigenvalues,
+  Proportion = round(prop_variance, 3),
+  Cumulative = round(cum_variance, 3)
+)
+
+print(variance_explained)
+```
+
+### Choosing the first 3 PCs as they explain 80+% of the variance for the PCA of covariance matrix. \nThen adding the individual variable's contributions to the loadings for these PCs
+```{r contributionsvars, echo=FALSE}
+# Step 8: Rank variable contributions to the first 3 PCs (optional)
+# I chose 3 PCs because they explained 82% of the variance
+loadings <- pca_result$rotation
+contrib_pc1 <- loadings[, 1]^2
+contrib_pc2 <- loadings[, 2]^2
+contrib_pc3 <- loadings[, 3]^2
+total_contrib <- contrib_pc1 + contrib_pc2 + contrib_pc3
+
+# Rank by total contribution
+ranked_contrib <- sort(total_contrib, decreasing = TRUE)
+#print(ranked_contrib)
+
+```
+
+```{r var_contrib}
+#Visualization for these total contributions of variables
+
+total_cont <- ranked_contrib %>% 
+              tibble(
+            variable = names(.),  # The names of the vector are the variable names
+  contribution = .) 
+
+ggplot(total_cont, aes(x = reorder(variable, contribution), y = contribution)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  coord_flip() +
+  labs(title = "Variable Contributions to PCA (PC1, PC2, PC3)", 
+       x = "Variable", y = "Contribution") +
+  theme_minimal()
+
+# Optional: Plot a biplot of the PCA result
+biplot(pca_result, scale = 0, main = "PCA on Ranked and Transformed Variables")
+
+```
+
+For this analysis both Safe prescribing of Opioids and general care are most important. OP_29 represents the percentage of patients receiving appropriate recommendation for follow-up screening of a colonoscopy. OP_23, percentage of patients with stroke symptoms presenting at the ED who received brain scan results within 45 minutes and SEP_1, percentage of patients receiving apprioriate care for sepsis and septic shock, nextcontribute to these PCs. 
+
+The biplot of PC1 and PC2 shows similar contributions for OP_18b and OP_18c to PC1, time in emergency department for patients, and time in emergency department for pyschiatric patients. This is opposed or negatively correlated to OP_29. This may hint towards differences between Emergency Department efficiency and general practice care for screenings. What is interesting is the also the PC2 results, with Sepsis care being negatively coorelated to Safe Opioid prescribing. This may represent differences in pharmacovigilance, and pain management vs. quality of care for infectious and life-threatening disease, along PC2. 
+
+
+## The second PCA examines simply the ranks of the scores by state in order to look at state groupings in the data.
+### Examining Eigenvalues and cumulativevariance for selecting PCs
+   Again Eigenvalues are examined as well as a scree plot
+   These results have more PCs, here 4 are chosen for ~77% of the variance of the data
+
+```{r additionalanalyses_stateranks, echo=FALSE}
+# State clustering? 
+pca_scaled_states <- prcomp(ranked_numeric, center = TRUE, scale. = TRUE)
+
+# Step 7b: View eigenvalues and % variance explained for straight state ranks
+eigenvalues2 <- pca_scaled_states$sdev^2
+prop_variance2 <- eigenvalues2 / sum(eigenvalues2)
+cum_variance2 <- cumsum(prop_variance2)
+
+variance_explained2 <- data.frame(
+  PC = paste0("PC", 1:length(eigenvalues2)),
+  Eigenvalue = eigenvalues2,
+  Proportion = round(prop_variance2, 3),
+  Cumulative = round(cum_variance2, 3)
+)
+
+print(variance_explained2)
+
+screeplot(pca_scaled_states, type = "lines", main = "Scree Plot")
+```
+
+### Examining the loadings and contributions for the variables out of curiosity although this analysis is more aimed at grouping States for patterns based on geography.
+```{r variablecontr_loadings}
+
+# Step 8: Rank variable contributions to the first 4 PCs for the state data (optional)
+loadings2 <- pca_scaled_states$rotation
+contrib_pc1b <- loadings2[, 1]^2
+contrib_pc2b <- loadings2[, 2]^2
+contrib_pc3b <- loadings2[, 3]^2
+contrib_pc4b <- loadings2[, 4]^2
+total_contrib2 <- contrib_pc1b + contrib_pc2b + contrib_pc3b + contrib_pc4b
+
+
+# Rank by total contribution
+ranked_contrib2 <- sort(total_contrib2, decreasing = TRUE)
+#print(ranked_contrib2)
+
+
+#not sure this is necessary because does total contributions for variables with state groupings analysis
+total_cont2 <- ranked_contrib2 %>% 
+              tibble(
+            variable = names(.),  # The names of the vector are the variable names
+  contribution = .) 
+
+print(total_contrib2)
+
+```
+
+
+### Preparing the data for the groupings of the states and performing Kmeans clustering
+```{r PCA_basiccont, warning=FALSE}
+# Extracting the state scores (projections) onto the PCs
+
+state_names <- hosp_ranked[[id_var]]  # e.g., state abbreviations
+
+# Get the PCA scores (these are your transformed coordinates in PC space)
+state_scores <- as.data.frame(pca_scaled_states$x[, 1:4])  # taking the first 4 PCs as Eigen value ~1 or more ; explains 77% of the variance
+state_scores$state <- state_names
+
+
+set.seed(555)  # set seed to reproduce results
+kmeans_result <- kmeans(state_scores[, 1:4], centers = 3, nstart = 25)
+state_scores$cluster <- kmeans_result$cluster
+
+# Aggregating the 4 PCs contributions to the state clusters:
+cluster_agg <- aggregate(. ~ cluster, data = state_scores[, c("PC1", "PC2", "PC3", "PC4", "cluster")], mean)
+
+
+```
+
+### 3D Plotly to examine the first 3 PCs with the clusters
+```{r 3DPC_plot2, echo=FALSE}
+plot_ly(state_scores, 
+        x = ~PC1, y = ~PC2, z = ~PC3,
+        type = 'scatter3d', mode = 'markers+text',
+        color = ~factor(cluster), text = ~state,
+        marker = list(size = 5)) %>%
+    layout(title = "3D PCA Clustering of States")
+
+```
+
+### Examining the 4 PCs for the state data
+```{r 2PC_plots, echo=FALSE}
+# 1 and 2
+ggplot(state_scores, aes(x = pca_scaled_states$x[, 1], y = pca_scaled_states$x[, 2], color = cluster)) +
+    geom_point(size = 3) +
+    labs(
+        title = "States Clustered by PCA Scores (First Two Principal Components)",
+        x = "PC1: ED Efficiency & Quality",
+        y = "PC2: Safety and Protocol Driven"
+    ) +
+    theme_minimal()
+
+#3& 4
+ggplot(state_scores, aes(x = pca_scaled_states$x[, 3], y = pca_scaled_states$x[, 4], color = cluster)) +
+    geom_point(size = 3) +
+    labs(
+        title = "States Clustered by PCA Scores (Principal Components 3 & 4)",
+        x = "PC3: Preventative Screening/General Practice",
+        y = "PC4: ED neurological triage"
+    ) +
+    theme_minimal()
+
+
+```
+
+### Contributions of the 4 PCs for the clusters
+```{r cluster_averagePC, warning=FALSE}
+cluster_summary <- state_scores %>%
+     group_by(cluster) %>%
+     summarise(across(PC1:PC4, mean, .names = "mean_{.col}"))
+
+```
+
+
+## Mapping
+```{r maptrial, echo=FALSE, eval= FALSE}
+
+cluster_map_data <- state_scores %>%
+  select(State, Cluster)
+
+# Create the choropleth map
+plot_usmap(data = cluster_map_data, values = "Cluster", regions = "states") +
+  scale_fill_manual(
+    values = c("1" = "#1b9e77", "2" = "#d95f02", "3" = "#7570b3"),  # customize as needed
+    name = "Cluster"
+  ) +
+  labs(title = "State Clusters Based on Healthcare PCA Scores") +
+  theme_minimal()
+
+```
+
+```{r custommap_func_trial, echo=FALSE, eval=FALSE}
+#Iterations of functions during the exercise
+
+# Shift geometry
+
+
+#asked for metadata to not be dropped by this chatgpt function
+st_shift_crs <- function(x, shift_values) {
+  crs_before <- st_crs(x)  # Save original CRS
+  x_shifted <- x %>%
+    st_transform(crs = 2163) %>%  # Transform to the Albers projection
+    st_geometry() %>% 
+    st_shift(shift_values)  # Apply shifting
+  
+  # Return the geometry and set the CRS back to the original one
+  st_sf(geometry = x_shifted) %>% 
+    st_set_crs(crs_before)  # Reapply original CRS
+}
+
+st_shift2_crs <- function(x, shift_values) {
+  crs_before <- st_crs(x)  # Save original CRS
+  
+  # Transform to Albers projection (or appropriate projection)
+  x_shifted <- x %>%
+    st_transform(2163) %>%   # Transform to an appropriate CRS (Albers Equal Area)
+    st_geometry() %>% 
+    st_shift(shift_values)   # Apply shifting
+  
+  # Rewrap the shifted geometry back into an sf object
+  sf_object <- st_sf(geometry = x_shifted) %>% 
+    st_set_crs(crs_before)  # Reapply the original CRS
+  
+  return(sf_object)
+}
+
+st_shift3_crs <- function(x, shift_values) {
+  crs_before <- st_crs(x)  # Save the original CRS
+  
+  # Apply transformation to Albers projection (EPSG:2163) before shifting
+  x_transformed <- st_transform(x, 2163)
+  
+  # Apply shifting in the transformed CRS
+  x_shifted <- st_shift(x_transformed, shift_values)
+  
+  # Reassign the original CRS back to the shifted object
+  x_shifted <- st_set_crs(x_shifted, crs_before)
+  
+  return(x_shifted)
+}
+
+
+# Scale geometry
+
+
+st_scale_crs <- function(x, scale_factor) {
+  crs_before <- st_crs(x)  # Save original CRS
+  x_scaled <- x %>% 
+    st_transform(crs = 2163) %>%  # Transform to the Albers projection (or another appropriate CRS)
+    st_geometry() %>% 
+    st_scale(scale_factor)  # Apply scaling
+  
+  # Return the geometry and set the CRS back to the original one
+  st_sf(geometry = x_scaled) %>% 
+    st_set_crs(crs_before)  # Reapply original CRS
+}
+
+st_scale2_crs <- function(x, scale_factor) {
+  crs_before <- st_crs(x)  # Save original CRS
+  
+  # Transform to Albers projection (or appropriate projection)
+  x_scaled <- x %>% 
+    st_transform(2163) %>%   # Transform to an appropriate CRS (Albers Equal Area)
+    st_geometry() %>% 
+    st_scale(scale_factor)   # Apply scaling
+  
+  # Rewrap the scaled geometry back into an sf object
+  sf_object <- st_sf(geometry = x_scaled) %>% 
+    st_set_crs(crs_before)  # Reapply the original CRS
+  
+  return(sf_object)
+}
+
+st_scale3_crs <- function(x, scale_factor) {
+  crs_before <- st_crs(x)  # Save the original CRS
+  
+  # Apply transformation to Albers projection (EPSG:2163) before scaling
+  x_transformed <- st_transform(x, 2163)
+  
+  # Apply scaling in the transformed CRS
+  x_scaled <- st_scale(x_transformed, scale_factor)
+  
+  # Reassign the original CRS back to the scaled object
+  x_scaled <- st_set_crs(x_scaled, crs_before)
+  
+  return(x_scaled)
+}
+
+
+# Define scaling
+st_scale5_crs <- function(x, scale_factor) {
+  x_geom <- st_geometry(x)
+  x_centroid <- st_centroid(st_union(x_geom))
+  x_geom_scaled <- (x_geom - x_centroid) * scale_factor + x_centroid
+  st_geometry(x) <- x_geom_scaled
+  x
+}
+
+# Define shifting
+st_shift5_crs <- function(x, shift_vals) {
+  x_geom <- st_geometry(x)
+  x_geom_shifted <- x_geom + shift_vals
+  st_geometry(x) <- x_geom_shifted
+  x
+}
+
+rotation_matrix <- function(angle_deg) {
+  angle_rad <- angle_deg * pi / 180
+  matrix(c(cos(angle_rad), sin(angle_rad), -sin(angle_rad), cos(angle_rad)), nrow = 2)
+}
+
+rotate_geometry <- function(df, angle_deg) {
+  crs_before <- st_crs(df)
+  geometry2 <- st_geometry(df)  
+  centroid <- st_coordinates(st_centroid(geometry2))[1, ]
+  coords <- st_coordinates(geometry2)
+  coords_centered <- sweep(coords[, 1:2], 2, centroid, "-")  # subtract centroid
+ # coords_centered <- coords - centroid
+  rotation <- rotation_matrix(angle_deg)
+  coords_rotated <- coords_centered[,1:2] %*% rotation
+  colnames(coords_rotated)[1:2] <- c('X', 'Y')
+  coords_translated <- coords_rotated + centroid
+  coords_translatedb <- cbind(coords_translated, coords[,-c(1,2)])
+  geometry <- st_sfc(st_multipolygon(coords_translated), crs = crs_before)
+  df2 <- as.data.frame(df)[,-ncol(df)]
+  st_sf(geometry, df2, crs=crs_before)
+}
+
+
+```
+
+
+```{r custom_mapfunc, echo=FALSE}
+#Shifting function, maintaining the CRS
+st_shift <- function(sf_obj, shift = c(0, 0)) {
+  st_geometry(sf_obj) <- st_geometry(sf_obj) + shift
+  sf_obj
+}
+
+
+st_shift4_crs <- function(x, shift_values) {
+  crs_before <- st_crs(x)  # Save the original CRS
+  
+  # Apply transformation to Albers projection (EPSG:2163) before shifting
+  x_transformed <- st_transform(x, 2163)
+  
+  # Apply shifting in the transformed CRS
+  x_shifted <- st_shift(x_transformed, shift_values)
+  
+  # Return the shifted object with the original CRS
+  st_set_crs(x_shifted, crs_before)
+}
+
+
+#Scaling function, maintaining the CRS
+st_scale <- function(sf_obj, scale = 1) {
+  st_geometry(sf_obj) <- (st_geometry(sf_obj) - st_centroid(st_union(st_geometry(sf_obj)))) * scale +
+    st_centroid(st_union(st_geometry(sf_obj)))
+  sf_obj
+}
+
+st_scale4_crs <- function(x, scale_factor) {
+  crs_before <- st_crs(x)  # Save the original CRS
+  
+  # Apply transformation to Albers projection (EPSG:2163) before scaling
+  x_transformed <- st_transform(x, 2163)
+  
+  # Apply scaling in the transformed CRS
+  x_scaled <- st_scale(x_transformed, scale_factor)
+  
+  # Return the scaled object with the original CRS
+  st_set_crs(x_scaled, crs_before)
+}
+
+#Rotation functions to rotate polygons
+rotation_matrix <- function(angle_deg) {
+  angle_rad <- angle_deg * pi / 180
+  matrix(c(cos(angle_rad), sin(angle_rad), -sin(angle_rad), cos(angle_rad)), nrow = 2)
+}
+
+#ChatGPT revamp - seems a bit much just to get the new multipolygon structure!
+rotate_geometry2 <- function(df, angle_deg) {
+  crs_before <- st_crs(df)
+  geometry <- st_geometry(df)
+  
+  # Calculate centroid of the geometry
+  centroid <- st_coordinates(st_centroid(geometry))[1, 1:2]
+  
+  # Extract coordinates and apply rotation
+  coords <- st_coordinates(geometry)
+  rotation <- rotation_matrix(angle_deg)
+  
+  xy_centered <- sweep(coords[, 1:2], 2, centroid, "-")
+  xy_rotated <- xy_centered %*% rotation
+  xy_translated <- sweep(xy_rotated, 2, centroid, "+")
+  
+  # Combine rotated coordinates with remaining structure (L1, L2, L3...)
+  coords_translated <- cbind(xy_translated, coords[, -c(1, 2), drop = FALSE])
+  colnames(coords_translated)[1:2] <- c("X", "Y")
+  
+  # Determine grouping columns for nested polygon structure
+  group_cols <- intersect(c("L1", "L2", "L3"), colnames(coords_translated))
+  group_ids <- do.call(paste, c(as.data.frame(coords_translated[, group_cols, drop = FALSE]), sep = "_"))
+  
+  # Split coordinates into ring parts
+  parts <- split(coords_translated[, c("X", "Y")], group_ids)
+  
+  # Rebuild each ring, ensuring closure
+  rings <- lapply(parts, function(pts) {
+    mat <- matrix(unlist(pts), ncol = 2, byrow = FALSE)
+    if (!all(mat[1, ] == mat[nrow(mat), ])) {
+      mat <- rbind(mat, mat[1, ])  # Close the ring if not already
+    }
+    mat
+  })
+  
+  # Group rings into polygons by L1
+  polygons <- split(rings, gsub("\\..*", "", names(parts)))
+  multipolygon_list <- lapply(polygons, unname)
+  
+  # Create new geometry
+  new_geom <- st_sfc(st_multipolygon(multipolygon_list), crs = crs_before)
+  df_out <- st_sf(st_drop_geometry(df), geometry = new_geom)
+  
+  return(df_out)
+}
+
+```
+
+### Data preparation using custom functions for spatial data processing
+```{r maptrial2_dataprep, warning=FALSE, message=FALSE}
+# Join abbreviations and names for help joining with map datasets
+
+statekey <- cbind(state.name, state.abb) %>% 
+            rbind(c('District of Columbia', 'DC')) %>% 
+            as_tibble(.) %>% 
+            rename(
+                'region' = 'state.name',
+                'stabb' = 'state.abb'
+            ) %>% 
+             arrange(region) %>% 
+            rbind(c('Puerto Rico', 'PR')) %>% 
+            mutate(region=tolower(region)) 
+            
+
+#Edited code from ChatGPT with some modification for joins
+
+# Get state geometries
+states_formap <- tigris::states(cb = TRUE, resolution = "20m", class = "sf") %>% 
+                 st_transform(2163)  # Albers Equal Area projection
+
+# Check CRS of the full data
+#st_crs(states_formap)  # should be EPSG:4269 (NAD83)
+
+# Alaska, explicitly resetting CRS after filtering
+alaska <- states_formap %>%
+    filter(STUSPS == "AK") %>%
+   # st_set_crs(4269) %>%  # Ensure original CRS is set (NAD83)
+    st_transform(2163) %>%  # Transform to Albers projection (EPSG:2163)
+    st_scale4_crs(0.35) %>%  # Scale with CRS preservation
+    st_shift4_crs(c(700000, - 4900000)) %>% #manually puts just south of CA
+    rotate_geometry2(., -40) #manually roates the state for inset
+
+
+# Hawaii
+hawaii <- states_formap %>% filter(STUSPS == "HI") %>%
+  st_transform(2163) %>%
+  st_shift4_crs(c(5000000, -1450000)) %>% #manual shift for index
+  rotate_geometry2(., -40)
+
+
+# Puerto Rico
+puerto_rico <- states_formap %>% filter(STUSPS == "PR") %>%
+  st_transform(2163) %>%
+  st_shift4_crs(c(-1200000, -30000)) %>%  # manual shift for index
+  rotate_geometry2(., 15)
+
+# # Combine Alaska, Hawaii, and Puerto Rico with the rest of the states
+remaining_states <- states_formap %>%
+  filter(!(STUSPS %in% c("AK", "HI", "PR")))
+
+# Combine the transformed data
+states_combined <- bind_rows(remaining_states, alaska, hawaii, puerto_rico)
+
+```
+
+# Map of Kmeans Clusters for PCAs in the US and Puerto Rico
+
+```{r clustermap1, warning=FALSE, message=FALSE}
+# Plot
+map1 <- left_join(states_combined, state_scores, by = c("STUSPS" = "state")) %>% 
+    ggplot(.) +
+    geom_sf(aes(fill = as.factor(cluster)), color = "white", size = 0.2) +
+    scale_fill_manual(values = c("1" = "#1b9e77", "2" = "#d95f02", "3" = "#7570b3")) +
+    labs(title = "U.S. Healthcare Clusters (from tigris map)", fill = "Cluster") +
+    theme_void() +
+    scale_fill_manual(values = c("1" = "#1b9e77", "2" = "#d95f02", "3" = "#7570b3"),
+                      labels = c("1: High Acute Care Performance,\n   Lower opioid/clinical safety", 
+                                 "2: Better safety scores & avg ED scores,\n   Poorer gen practice", 
+                                 "3: Prevention-oriented,\n    Most ED scores poor")) + 
+    labs(fill = "Cluster Type", 
+         title = "State Healthcare System Clusters*",
+         subtitle = "Based on PCA + Cluster Analysis of CMS Measures",
+         caption = '*Includes Puerto Rico') #+
+   # theme_void() +
+   # theme(
+        # Move legend slightly left, outside map area
+    #    legend.position = c(1.1, 0.5),  # Shift from right to just a bit left
+        # Add small margin at top and left
+     #   plot.margin = margin(t = 2, r = 40, b = 2, l = -120)
+    #)
+
+map1
+
+```
+
+```{r priorlabels, echo=FALSE, eval=FALSE}
+left_join(states_combined, state_scores, by = c("STUSPS" = "state")) %>% 
+ggplot(.) +
+  geom_sf(aes(fill = as.factor(cluster)), color = "white", size = 0.2) +
+  scale_fill_manual(values = c("1" = "#1b9e77", "2" = "#d95f02", "3" = "#7570b3")) +
+  labs(title = "U.S. Healthcare Clusters (from tigris map)", fill = "Cluster") +
+  theme_void() +
+  scale_fill_manual(values = c("1" = "#1b9e77", "2" = "#d95f02", "3" = "#7570b3"),
+                    labels = c("1: High ED Performance", # may need to change these labels or provide a key
+                               "2: Prevention-Oriented", 
+                               "3: Targeted Quality Focus")) + # not sure I like this name for PC3
+  labs(fill = "Cluster Type", 
+       title = "State Healthcare System Clusters*",
+       subtitle = "Based on PCA + Cluster Analysis of CMS Measures",
+       caption = '*Includes Puerto Rico')
+
+```
+
+```{r maptrial3, echo=FALSE, eval=FALSE}
+# Plot with `usmap`
+plot_usmap(data = state_scores, values = as.factor"cluster", regions = "states") +
+  scale_fill_manual(values = c("1" = "#1b9e77", "2" = "#d95f02", "3" = "#7570b3")) +
+  labs(fill = "Cluster", title = "Healthcare Clusters by State") +
+  theme(legend.position = "right")
+
+
+# Making sure to add the names for the states/territories
+state_scoresnm <- left_join(state_scores, statekey, by = c('state' = 'stabb'))
+
+# Join with map data
+states_map <- map_data("state")
+map_df <- left_join(states_map, state_scoresnm, by = "region")
+
+# Plot
+ggplot(map_df, aes(long, lat, group = group, fill = as.factor(cluster))) +
+  geom_polygon(color = "white") +
+  theme_void() +
+  scale_fill_manual(values = c("1" = "#1b9e77", "2" = "#d95f02", "3" = "#7570b3"),
+                    labels = c("1: High ED Performance", 
+                               "2: Prevention-Oriented", 
+                               "3: Targeted Quality Focus")) + # not sure I like this name for PC3
+  labs(fill = "Cluster Type", 
+       title = "State Healthcare System Clusters",
+       subtitle = "Based on PCA + Cluster Analysis of CMS Measures")
+
+
+```
+
+# Secondary analysis of the scores with income and population density considered
+## Data prep
+```{r joinGINIlandpop, warning=FALSE, message=FALSE}
+#poverty stats are by state name, so need to reconvert statekey to camel case and join
+#state area data already has USPS abbreviations
+#cen_totpop has names
+#datasets are: acs_incdat, state_area_data, cen_totpop
+
+extra_vars <- cen_totpop %>% 
+              rename(pop2020 = value) %>% 
+              select(-c(variable)) %>% 
+              right_join(., acs_incdat, by = c('GEOID', 'NAME')) %>% 
+              left_join(., state_area_data, by = c('GEOID', 'NAME')) %>% 
+              rename(state = USPS) %>% 
+              relocate(state, .before=everything()) %>% 
+              select(c(state, pop2020, ALAND_SQMI, median_incE, gini_indE)) %>% 
+              mutate(popdensity = pop2020/ALAND_SQMI,
+                     gini_Eflip = 1 - gini_indE) %>% # the lower the GINI score, the more equality so flipping this
+              select(-c(pop2020, ALAND_SQMI, gini_indE)) 
+
+
+# Step 3: Rank all numeric variables (but keep the ID variable as it is)
+hosp_ranked2 <- hospdat_flipped %>%
+                left_join(., extra_vars, by = 'state') %>% 
+                mutate(across(where(is.numeric), ~rank(-., ties.method = "min"))) #giving lower ranks to higher scores and handling ties as the minimum possible rank and same values
+
+# Step 4: Extract numeric data (for PCA) and drop the ID variable (State)
+ranked_numeric2 <- hosp_ranked2 %>%
+  select(-all_of(id_var))
+
+
+```
+
+## PCA for the states including the income inequality, median_income, and population density ranks
+
+```{r additionalanalyses_stateranks2, echo=FALSE}
+# State clustering? 
+pca_scaled_states2 <- prcomp(ranked_numeric2, center = TRUE, scale. = TRUE)
+
+# Step 7b: View eigenvalues and % variance explained for straight state ranks
+eigenvalues2b <- pca_scaled_states2$sdev^2
+prop_variance2b <- eigenvalues2b / sum(eigenvalues2b)
+cum_variance2b <- cumsum(prop_variance2b)
+
+variance_explained2b <- data.frame(
+  PC = paste0("PC", 1:length(eigenvalues2b)),
+  Eigenvalue = eigenvalues2b,
+  Proportion = round(prop_variance2b, 3),
+  Cumulative = round(cum_variance2b, 3)
+)
+
+print(variance_explained2b)
+
+screeplot(pca_scaled_states2, type = "lines", main = "Scree Plot")
+```
+
+### Examining the loadings and contributions for the variables out of curiosity although this analysis is more aimed at grouping States for patterns based on geography.
+```{r variablecontr_loadings2b}
+
+# Step 8: Rank variable contributions to the first 5 PCs for the state data (optional) - later I work on 4 PCs given the EigenValues
+loadings2b <- pca_scaled_states2$rotation
+contrib_pc1c <- loadings2b[, 1]^2
+contrib_pc2c <- loadings2b[, 2]^2
+contrib_pc3c <- loadings2b[, 3]^2
+contrib_pc4c <- loadings2b[, 4]^2
+contrib_pc5c <- loadings2b[, 5]^2
+
+total_contrib2b <- contrib_pc1c + contrib_pc2c + contrib_pc3c + contrib_pc4c + contrib_pc5c
+
+
+# Rank by total contribution
+ranked_contrib2b <- sort(total_contrib2b, decreasing = TRUE)
+#print(ranked_contrib2)
+
+
+#not sure this is necessary because does total contributions for variables with state groupings analysis, this includes PC5
+total_cont2b <- ranked_contrib2b %>% 
+              tibble(
+            variable = names(.),  # The names of the vector are the variable names
+  contribution = .) 
+
+print(total_cont2b)
+```
+
+
+
+```{r incom_popdens, echo=FALSE}
+# Get the PCA scores (these are your transformed coordinates in PC space)
+state_scores2 <- as.data.frame(pca_scaled_states2$x[, 1:4])  # taking the first 4 PCs as Eigen value ~1 or more ; explains 71% of the variance
+state_scores2$state <- state_names
+
+
+set.seed(555)  # set seed to reproduce results
+kmeans_result2 <- kmeans(state_scores2[, 1:4], centers = 3, nstart = 25)
+state_scores2$cluster <- kmeans_result2$cluster
+
+# Aggregating the 4 PCs contributions to the state clusters:
+cluster_agg2 <- aggregate(. ~ cluster, data = state_scores2[, c("PC1", "PC2", "PC3", "PC4", "cluster")], mean)
+
+
+```
+
+```{r loadingstable, echo=FALSE, warning=FALSE}
+tablestatinc<-loadings2b[,1:4] # making a nice table
+
+tablestatinc %>%
+  as_tibble(., rownames='Variable') %>% 
+gt() %>%
+  tab_header(
+    title = "Loadings for the First 4 PCs"
+  ) %>%
+  cols_label(
+    Variable = "Healthcare Variable",
+    PC1 = "PC1 Loading",
+    PC2 = "PC2 Loading",
+    PC3 = "PC3 Loading",
+    PC4 = "PC4 Loading"
+  ) %>%
+  tab_spanner(
+    label = "Principal Components",
+    columns = c(PC1, PC2, PC3, PC4)
+  ) %>%
+  fmt_number(
+    columns = vars(PC1, PC2, PC3, PC4),
+    decimals = 3
+  ) %>%
+  tab_style(
+    style = list(
+      cell_borders(sides = "all", color = "gray", weight = 0.5)
+    ),
+    locations = cells_body(columns = vars(Variable))
+  ) %>%
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels(columns = vars(Variable))
+  ) %>%
+  tab_style(
+    style = cell_text(size = 14),
+    locations = cells_title()
+  ) %>%
+  tab_options(
+    table.width = 600
+  )
+
+
+cluster_agg2 %>% 
+  gt() %>%
+    tab_header(
+          title = "Cluster Summary for Principal Components"
+      ) %>%
+      cols_label(
+        cluster = "State Cluster",
+        PC1 = "PC1 Mean",
+        PC2 = "PC2 Mean",
+        PC3 = "PC3 Mean",
+        PC4 = "PC4 Mean"
+      ) %>%
+      fmt_number(
+        columns = vars(PC1, PC2, PC3, PC4),
+        decimals = 3
+      ) %>%
+      tab_style(
+        style = list(
+          cell_borders(sides = "all", color = "gray", weight = 0.5)
+        ),
+        locations = cells_body(columns = vars(cluster))
+      ) %>%
+      tab_style(
+        style = cell_text(weight = "bold"),
+        locations = cells_column_labels(columns = vars(cluster))
+      ) %>%
+      tab_style(
+        style = cell_text(size = 14),
+        locations = cells_title()
+      ) %>%
+      tab_options(
+        table.width = 600
+      )
+
+```
+
+
+### 3D Plotly to examine the first 3 PCs with the clusters
+```{r 3DPC_plot, echo=FALSE}
+plot_ly(state_scores2, 
+        x = ~PC1, y = ~PC2, z = ~PC3,
+        type = 'scatter3d', mode = 'markers+text',
+        color = ~factor(cluster), text = ~state,
+        marker = list(size = 5)) %>%
+    layout(title = "3D PCA Clustering of States")
+
+```
+
+## Mapping the State Clusters with median income, GINI index and population density accounted for
+```{r mapping_pcaw_extravars, echo=FALSE, warning=FALSE, message=FALSE}
+# Map state clusters with interpretive labels
+map2 <- left_join(states_combined, state_scores2, by = c("STUSPS" = "state")) %>% 
+  ggplot() +
+  geom_sf(aes(fill = as.factor(cluster)), color = "white", size = 0.2) +
+  scale_fill_manual(
+    values = c("1" = "#1b9e77", "2" = "#d95f02", "3" = "#7570b3"),
+    labels = c(
+      "1: Balanced Healthcare Systems",
+      "2: Timely ED, low preventative care",
+      "3: Poor ED and Preventive Care\n moderate income"
+    )
+  ) +
+  theme_void() +
+  labs(
+    fill = "Healthcare Cluster",
+    title = "State Healthcare System Clusters",
+    subtitle = "PCA and Kmeans Clusters of CMS Quality Measures with State Population Information",
+    caption = "*Includes Puerto Rico"
+  ) #+
+  #theme_void() +
+  #theme(
+   # legend.position = c(1.1, 0.5),
+  #  plot.margin = margin(t = 2, r = 40, b = 2, l = -120),
+  #  plot.title = element_text(face = "bold", size = 14),
+  #  plot.subtitle = element_text(size = 10),
+  #  plot.caption = element_text(size = 8),
+  #  legend.title = element_text(face = "bold"),
+  #  legend.text = element_text(size = 9)
+  #)
+
+map2
+
+```
